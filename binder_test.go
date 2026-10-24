@@ -3250,3 +3250,124 @@ func TestValueBinder_DurationsError(t *testing.T) {
 		})
 	}
 }
+
+func TestValueBinder_CustomType(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	t.Run("ok, scalar from query", func(t *testing.T) {
+		c := createTestContext("/?p=1,2", nil, nil)
+		var p customDecPoint
+		err := QueryParamsBinder(c).CustomType("p", &p).BindError()
+		if assert.NoError(t, err) {
+			assert.Equal(t, customDecPoint{X: 1, Y: 2}, p)
+		}
+	})
+
+	t.Run("ok, scalar from path", func(t *testing.T) {
+		c := createTestContext("/", nil, map[string]string{"p": "3,4"})
+		var p customDecPoint
+		err := PathValuesBinder(c).CustomType("p", &p).BindError()
+		if assert.NoError(t, err) {
+			assert.Equal(t, customDecPoint{X: 3, Y: 4}, p)
+		}
+	})
+
+	t.Run("ok, repeated values into a slice", func(t *testing.T) {
+		c := createTestContext("/?p=1,2&p=3,4", nil, nil)
+		var points []customDecPoint
+		err := QueryParamsBinder(c).CustomType("p", &points).BindError()
+		if assert.NoError(t, err) {
+			assert.Equal(t, []customDecPoint{{X: 1, Y: 2}, {X: 3, Y: 4}}, points)
+		}
+	})
+
+	t.Run("ok, empty value decodes to zero", func(t *testing.T) {
+		c := createTestContext("/?p=", nil, nil)
+		p := customDecPoint{X: 9, Y: 9}
+		err := QueryParamsBinder(c).CustomType("p", &p).BindError()
+		if assert.NoError(t, err) {
+			assert.Equal(t, customDecPoint{}, p)
+		}
+	})
+
+	t.Run("ok, absent parameter leaves destination untouched", func(t *testing.T) {
+		c := createTestContext("/?other=1", nil, nil)
+		p := customDecPoint{X: 9, Y: 9}
+		err := QueryParamsBinder(c).CustomType("p", &p).BindError()
+		if assert.NoError(t, err) {
+			assert.Equal(t, customDecPoint{X: 9, Y: 9}, p)
+		}
+	})
+
+	t.Run("nok, must bind absent parameter", func(t *testing.T) {
+		c := createTestContext("/?other=1", nil, nil)
+		var p customDecPoint
+		err := QueryParamsBinder(c).MustCustomType("p", &p).BindError()
+
+		bErr := new(BindingError)
+		if assert.ErrorAs(t, err, &bErr) {
+			assert.Equal(t, "p", bErr.Field)
+			assert.Equal(t, "required field value is empty", bErr.Message)
+		}
+		assert.Equal(t, customDecPoint{}, p)
+	})
+
+	t.Run("nok, decoder failure keeps BindingError envelope", func(t *testing.T) {
+		c := createTestContext("/?p=bad", nil, nil)
+		var p customDecPoint
+		err := QueryParamsBinder(c).CustomType("p", &p).BindError()
+
+		bErr := new(BindingError)
+		if assert.ErrorAs(t, err, &bErr) {
+			assert.Equal(t, "p", bErr.Field)
+			assert.Equal(t, "failed to bind field value with registered custom decoder", bErr.Message)
+			assert.EqualError(t, bErr.Unwrap(), `invalid point "bad"`)
+		}
+		assert.Equal(t, customDecPoint{}, p)
+	})
+
+	t.Run("nok, no decoder registered for destination type", func(t *testing.T) {
+		c := createTestContext("/?p=1", nil, nil)
+		var plain customDecPlain
+		err := QueryParamsBinder(c).CustomType("p", &plain).BindError()
+		assert.ErrorContains(t, err, "no custom field decoder registered for type *echo.customDecPlain")
+	})
+
+	t.Run("nok, destination is not a pointer", func(t *testing.T) {
+		c := createTestContext("/?p=1", nil, nil)
+		var notPointer string
+		err := QueryParamsBinder(c).CustomType("p", notPointer).BindError()
+		assert.ErrorContains(t, err, "custom type bind destination must be a non-nil pointer, got string")
+	})
+
+	t.Run("nok, destination is a nil pointer", func(t *testing.T) {
+		c := createTestContext("/?p=1", nil, nil)
+		var nilPointer *customDecPoint
+		err := QueryParamsBinder(c).CustomType("p", nilPointer).BindError()
+		assert.ErrorContains(t, err, "custom type bind destination must be a non-nil pointer")
+	})
+}
+
+// CustomType errors go through the same ErrorFunc as every other ValueBinder
+// method, so DefaultHTTPErrorHandler keeps serializing them as the structured
+// {"field","message"} response instead of flattening the message.
+func TestValueBinder_CustomType_ErrorResponseJSON(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	e := New()
+	e.GET("/doc", func(c *Context) error {
+		var p customDecPoint
+		return QueryParamsBinder(c).MustCustomType("p", &p).BindError()
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/doc?p=bad", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var body map[string]any
+	assert.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.Equal(t, "p", body["field"])
+	assert.Equal(t, "failed to bind field value with registered custom decoder", body["message"])
+}

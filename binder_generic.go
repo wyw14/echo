@@ -7,9 +7,55 @@ import (
 	"encoding"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 )
+
+// RegisterTypeDecoder registers a custom field decoder for values of type T.
+// The decoder is used by ParseValue/ParseValues, the Path/Query/Form generic
+// binders, the ValueBinder (ValueBinder.CustomType) and struct binding from
+// path parameters, query parameters, headers and form bodies
+// (DefaultBinder/BindPathValues/BindQueryParams/BindHeaders/BindBody) whenever
+// a request value of type T has to be decoded from strings. JSON and XML
+// request bodies are decoded by their serializers and do not use the registry.
+//
+// The decoder receives all raw string values bound to one field: one element
+// for scalar bindings and for each element of []T/[N]T, or every repeated
+// parameter value (e.g. "?tag=a&tag=b") when T itself is the destination type
+// (named slice/array types included). Empty strings are passed as-is.
+//
+// Built-in types and types implementing BindUnmarshaler or
+// encoding.TextUnmarshaler keep taking precedence over a registered decoder,
+// so registering a decoder never changes the behavior of types the binder
+// already supports. Registration is safe for concurrent use (including reads
+// from in-flight requests) and is usually done once from init(). Passing a nil
+// decoder panics. Use UnregisterTypeDecoder to remove it.
+//
+// Example - bind a third-party type from a path/query/header/form value:
+//
+//	echo.RegisterTypeDecoder(func(values []string) (url.URL, error) {
+//	    u, err := url.Parse(values[0])
+//	    return *u, err
+//	})
+func RegisterTypeDecoder[T any](decoder func(values []string) (T, error)) {
+	if decoder == nil {
+		panic("echo: RegisterTypeDecoder decoder cannot be nil")
+	}
+	var zero T
+	typ := reflect.TypeOf(&zero).Elem()
+	registerFieldDecoder(typ, func(values []string) (any, error) {
+		return decoder(values)
+	})
+}
+
+// UnregisterTypeDecoder removes the custom field decoder registered for type T.
+// It is safe to call for a type without a registered decoder and safe for
+// concurrent use with in-flight binding requests.
+func UnregisterTypeDecoder[T any]() {
+	var zero T
+	unregisterFieldDecoder(reflect.TypeOf(&zero).Elem())
+}
 
 // TimeLayout specifies the format for parsing time values in request parameters.
 // It can be a standard Go time layout string or one of the special Unix time layouts.
@@ -363,6 +409,7 @@ func ParseValuesOr[T any](values []string, defaultValue []T, opts ...any) ([]T, 
 //   - json.Unmarshaler interface
 //   - time.Duration
 //   - time.Time use echo.TimeOpts or echo.TimeLayout to set time parsing configuration
+//   - any type T (or []T) with a decoder registered through RegisterTypeDecoder
 func ParseValue[T any](value string, opts ...any) (T, error) {
 	var zero T
 	return ParseValueOr(value, zero, opts...)
@@ -565,6 +612,14 @@ func bindValue(value string, dest any, opts ...any) error {
 			return err
 		}
 	default:
+		// custom decoder registered for T (or *T/[]T/[N]T) - built-in types and
+		// the unmarshaler interfaces above always take precedence.
+		rv := reflect.ValueOf(dest)
+		if rv.Kind() == reflect.Pointer {
+			if ok, err := decodeRegisteredInto([]string{value}, rv.Elem()); ok {
+				return err
+			}
+		}
 		return fmt.Errorf("unsupported value type: %T", dest)
 	}
 	return nil

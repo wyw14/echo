@@ -341,6 +341,17 @@ func bindData(destination any, data map[string][]string, tag string, dataFiles m
 			continue
 		}
 
+		// custom decoder registered for the field type or its element/slice/array
+		// type (see RegisterTypeDecoder). Interfaces and time format tags above keep
+		// precedence; unregistered types fall through to the built-in conversions so
+		// that all previous behavior (incl. error messages) is preserved.
+		if ok, err := decodeRegisteredInto(inputValue, structField); ok {
+			if err != nil {
+				return fmt.Errorf("%s: %w", inputFieldName, err)
+			}
+			continue
+		}
+
 		// we could be dealing with pointer to slice `*[]string` so dereference it. There are weird OpenAPI generators
 		// that could create struct fields like that.
 		if structFieldKind == reflect.Pointer {

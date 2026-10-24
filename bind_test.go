@@ -1873,3 +1873,394 @@ func TestOpenAPIFormatTimeBindingEdgeCases(t *testing.T) {
 		})
 	}
 }
+
+// customDecPlain is a tagged struct type without a registered decoder; binding it
+// must keep failing with the pre-registry "unknown type" error.
+type customDecPlain struct {
+	V int
+}
+
+// A decoder registered for a user type is used by every string-based binding
+// source: path params, query params, headers and form bodies.
+func TestBind_CustomDecoder_AllSources(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+	registerTestDecoder(t, decodeTestDate)
+	expected := customDecPoint{X: 1, Y: 2}
+
+	t.Run("path params", func(t *testing.T) {
+		c := NewContext(nil, nil)
+		c.SetPathValues(PathValues{{Name: "p", Value: "1,2"}})
+
+		var result struct {
+			P customDecPoint `param:"p"`
+		}
+		assert.NoError(t, BindPathValues(c, &result))
+		assert.Equal(t, expected, result.P)
+	})
+
+	t.Run("query params", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?p=1,2", nil)
+		c := New().NewContext(req, httptest.NewRecorder())
+
+		var result struct {
+			P customDecPoint `query:"p"`
+		}
+		assert.NoError(t, BindQueryParams(c, &result))
+		assert.Equal(t, expected, result.P)
+	})
+
+	t.Run("headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Point", "1,2")
+		c := New().NewContext(req, httptest.NewRecorder())
+
+		var result struct {
+			P customDecPoint `header:"X-Point"`
+		}
+		assert.NoError(t, BindHeaders(c, &result))
+		assert.Equal(t, expected, result.P)
+	})
+
+	t.Run("form body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("p=5,6"))
+		req.Header.Set(HeaderContentType, MIMEApplicationForm)
+		c := New().NewContext(req, httptest.NewRecorder())
+
+		var result struct {
+			P customDecPoint `form:"p"`
+		}
+		assert.NoError(t, BindBody(c, &result))
+		assert.Equal(t, customDecPoint{X: 5, Y: 6}, result.P)
+	})
+
+	t.Run("time-like user type from query", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?d=2024-05-06", nil)
+		c := New().NewContext(req, httptest.NewRecorder())
+
+		var result struct {
+			D customDecDate `query:"d"`
+		}
+		assert.NoError(t, BindQueryParams(c, &result))
+		assert.Equal(t, customDecDate(time.Date(2024, 5, 6, 0, 0, 0, 0, time.UTC)), result.D)
+	})
+}
+
+// DefaultBinder keeps binding in the established order path -> query -> body,
+// including for fields populated through a registered decoder.
+func TestBind_CustomDecoder_SourcePrecedence(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	type DTO struct {
+		P customDecPoint `param:"p" query:"p" form:"p"`
+	}
+
+	t.Run("GET: query overrides path", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?p=3,4", nil)
+		c := New().NewContext(req, httptest.NewRecorder())
+		c.SetPathValues(PathValues{{Name: "p", Value: "1,2"}})
+
+		var dto DTO
+		assert.NoError(t, c.Bind(&dto))
+		assert.Equal(t, customDecPoint{X: 3, Y: 4}, dto.P)
+	})
+
+	t.Run("POST: query is skipped, path stays without form body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/?p=3,4", nil)
+		c := New().NewContext(req, httptest.NewRecorder())
+		c.SetPathValues(PathValues{{Name: "p", Value: "1,2"}})
+
+		var dto DTO
+		assert.NoError(t, c.Bind(&dto))
+		assert.Equal(t, customDecPoint{X: 1, Y: 2}, dto.P)
+	})
+
+	t.Run("POST: form body overrides path", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("p=7,8"))
+		req.Header.Set(HeaderContentType, MIMEApplicationForm)
+		c := New().NewContext(req, httptest.NewRecorder())
+		c.SetPathValues(PathValues{{Name: "p", Value: "1,2"}})
+
+		var dto DTO
+		assert.NoError(t, c.Bind(&dto))
+		assert.Equal(t, customDecPoint{X: 7, Y: 8}, dto.P)
+	})
+}
+
+// Pointer destinations are allocated on demand (nil -> set), mirroring the
+// existing BindUnmarshaler pointer behavior.
+func TestBind_CustomDecoder_Pointer(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	t.Run("nil pointer scalar is allocated and set", func(t *testing.T) {
+		result := struct {
+			P *customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1,2", &result)
+		if assert.NoError(t, err) && assert.NotNil(t, result.P) {
+			assert.Equal(t, customDecPoint{X: 1, Y: 2}, *result.P)
+		}
+	})
+
+	t.Run("nil pointer to slice is allocated with all values", func(t *testing.T) {
+		result := struct {
+			P *[]customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1,2&p=3,4", &result)
+		if assert.NoError(t, err) && assert.NotNil(t, result.P) {
+			assert.Equal(t, []customDecPoint{{X: 1, Y: 2}, {X: 3, Y: 4}}, *result.P)
+		}
+	})
+
+	t.Run("slice of pointers allocates every element", func(t *testing.T) {
+		result := struct {
+			P []*customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1,2&p=3,4", &result)
+		if assert.NoError(t, err) && assert.Len(t, result.P, 2) {
+			assert.Equal(t, customDecPoint{X: 1, Y: 2}, *result.P[0])
+			assert.Equal(t, customDecPoint{X: 3, Y: 4}, *result.P[1])
+		}
+	})
+
+	t.Run("non-nil pointer is reused, not replaced", func(t *testing.T) {
+		result := struct {
+			P *customDecPoint `query:"p"`
+		}{P: &customDecPoint{X: 100, Y: 200}}
+		original := result.P
+
+		err := testBindURL("/?p=1,2", &result)
+		if assert.NoError(t, err) && assert.Same(t, original, result.P) {
+			assert.Equal(t, customDecPoint{X: 1, Y: 2}, *result.P)
+		}
+	})
+}
+
+// Empty values decode to the zero value without an error; the raw empty string
+// is handed to the decoder, exactly like it is handed to UnmarshalParam.
+func TestBind_CustomDecoder_EmptyValues(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	t.Run("scalar empty value is zero", func(t *testing.T) {
+		result := struct {
+			P customDecPoint `query:"p"`
+		}{P: customDecPoint{X: 9, Y: 9}}
+
+		err := testBindURL("/?p=", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, customDecPoint{}, result.P)
+		}
+	})
+
+	t.Run("pointer empty value is allocated with zero value", func(t *testing.T) {
+		result := struct {
+			P *customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=", &result)
+		if assert.NoError(t, err) && assert.NotNil(t, result.P) {
+			assert.Equal(t, customDecPoint{}, *result.P)
+		}
+	})
+
+	t.Run("slice with an empty occurrence keeps its length", func(t *testing.T) {
+		result := struct {
+			P []customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1,2&p=", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, []customDecPoint{{X: 1, Y: 2}, {}}, result.P)
+		}
+	})
+
+	t.Run("built-in scalar empty value stays zero (conversion unchanged)", func(t *testing.T) {
+		result := struct {
+			N  int  `query:"n"`
+			PN *int `query:"pn"`
+		}{N: 5}
+
+		err := testBindURL("/?n=&pn=", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, 0, result.N)
+			if assert.NotNil(t, result.PN) {
+				assert.Equal(t, 0, *result.PN)
+			}
+		}
+	})
+}
+
+// Repeated fields: a scalar/type decoder receives every value, a decoder
+// registered for the element type fills one element per occurrence, and a
+// named slice type can define its own multi-value semantics.
+func TestBind_CustomDecoder_DuplicateFields(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+	registerTestDecoder(t, decodeTestTags)
+
+	t.Run("scalar decoder sees all repeated values (uses first)", func(t *testing.T) {
+		result := struct {
+			P customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1,2&p=3,4", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, customDecPoint{X: 1, Y: 2}, result.P)
+		}
+	})
+
+	t.Run("slice gets one decoded element per occurrence", func(t *testing.T) {
+		result := struct {
+			P []customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1,2&p=3,4&p=5,6", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, []customDecPoint{{X: 1, Y: 2}, {X: 3, Y: 4}, {X: 5, Y: 6}}, result.P)
+		}
+	})
+
+	t.Run("named slice type decoder receives all occurrences", func(t *testing.T) {
+		result := struct {
+			T customDecTags `query:"t"`
+		}{}
+
+		err := testBindURL("/?t=go&t=rust&t=python", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, customDecTags{"go", "rust", "python"}, result.T)
+		}
+	})
+
+	t.Run("repeated value keeps original order", func(t *testing.T) {
+		result := struct {
+			P []customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=9,8&p=7,6", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, []customDecPoint{{X: 9, Y: 8}, {X: 7, Y: 6}}, result.P)
+		}
+	})
+}
+
+// Fixed-size arrays are supported: registered element decoders fill elements,
+// built-in scalar kinds now bind as well, and overflow is reported per field.
+func TestBind_CustomDecoder_Arrays(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	t.Run("registered element type fills an array", func(t *testing.T) {
+		result := struct {
+			P [2]customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1,2&p=3,4", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, [2]customDecPoint{{X: 1, Y: 2}, {X: 3, Y: 4}}, result.P)
+		}
+	})
+
+	t.Run("built-in scalar array binds and leaves trailing zero", func(t *testing.T) {
+		result := struct {
+			A [3]int `query:"a"`
+		}{}
+
+		err := testBindURL("/?a=1&a=2", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, [3]int{1, 2, 0}, result.A)
+		}
+	})
+
+	t.Run("pointer to array is allocated", func(t *testing.T) {
+		result := struct {
+			A *[3]int `query:"a"`
+		}{}
+
+		err := testBindURL("/?a=1&a=2", &result)
+		if assert.NoError(t, err) && assert.NotNil(t, result.A) {
+			assert.Equal(t, [3]int{1, 2, 0}, *result.A)
+		}
+	})
+
+	t.Run("too many values is an error naming the field", func(t *testing.T) {
+		result := struct {
+			A [2]int `query:"a"`
+		}{}
+
+		err := testBindURL("/?a=1&a=2&a=3", &result)
+		if assert.Error(t, err) {
+			assert.EqualError(t, err, "code=400, message=Bad Request, err=a: too many values (3) for array [2]int of length 2")
+		}
+	})
+}
+
+// Decoder failures keep the same response envelope as built-in conversion
+// failures: HTTP 400 wrapping "<field>: <cause>". Types without a decoder and
+// without interface support keep failing as "unknown type", and unknown request
+// fields remain ignored.
+func TestBind_CustomDecoder_ErrorCompatibility(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	t.Run("decoder error is wrapped with the field name and HTTP 400", func(t *testing.T) {
+		result := struct {
+			P customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=bad", &result)
+		if assert.Error(t, err) {
+			assert.EqualError(t, err, `code=400, message=Bad Request, err=p: invalid point "bad"`)
+			httpErr, ok := err.(*HTTPError)
+			if assert.True(t, ok) {
+				assert.Equal(t, http.StatusBadRequest, httpErr.Code)
+			}
+		}
+	})
+
+	t.Run("form decoder error is wrapped with the field name", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("p=bad"))
+		req.Header.Set(HeaderContentType, MIMEApplicationForm)
+		c := New().NewContext(req, httptest.NewRecorder())
+
+		var result struct {
+			P customDecPoint `form:"p"`
+		}
+		err := c.Bind(&result)
+		assert.ErrorContains(t, err, "p: invalid point")
+	})
+
+	t.Run("unregistered user type still fails as unknown type", func(t *testing.T) {
+		result := struct {
+			P customDecPlain `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1", &result)
+		assert.EqualError(t, err, "code=400, message=Bad Request, err=p: unknown type")
+	})
+
+	t.Run("unknown request fields are still ignored", func(t *testing.T) {
+		result := struct {
+			P customDecPoint `query:"p"`
+		}{}
+
+		err := testBindURL("/?p=1,2&unknown=whatever&other=x", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, customDecPoint{X: 1, Y: 2}, result.P)
+		}
+	})
+
+	t.Run("TextUnmarshaler elements keep precedence over the registry", func(t *testing.T) {
+		// registering a decoder for a type implementing TextUnmarshaler must not
+		// change how []T elements are decoded
+		registerTestDecoder(t, func([]string) (TextUnmarshalerType, error) {
+			return TextUnmarshalerType{}, errors.New("registered decoder must not be called")
+		})
+
+		result := struct {
+			V []TextUnmarshalerType `query:"v"`
+		}{}
+		err := testBindURL("/?v=a&v=b", &result)
+		if assert.NoError(t, err) {
+			assert.Equal(t, []TextUnmarshalerType{{Value: "A"}, {Value: "B"}}, result.V)
+		}
+	})
+}

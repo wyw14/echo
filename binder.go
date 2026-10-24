@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -62,7 +64,8 @@ import (
 		* UnixTime() - converts unix time (integer) to time.Time
 		* UnixTimeMilli() - converts unix time with millisecond precision (integer) to time.Time
 		* UnixTimeNano() - converts unix time with nanosecond precision (integer) to time.Time
-		* CustomFunc() - callback function for your custom conversion logic. Signature `func(values []string) []error`
+	* CustomFunc() - callback function for your custom conversion logic. Signature `func(values []string) []error`
+	* CustomType()/MustCustomType() - bind using the custom decoder registered for the destination type with RegisterTypeDecoder
 */
 
 // BindingError represents an error that occurred while binding request data.
@@ -107,6 +110,222 @@ func (be *BindingError) MarshalJSON() ([]byte, error) {
 		Field:   be.Field,
 		Message: message,
 	})
+}
+
+// FieldDecoderFunc is a custom decoder registered for a specific Go type with
+// RegisterTypeDecoder. It turns the raw string values bound to one request
+// field or parameter into the decoded Go value.
+//
+// The values slice contains:
+//   - one element for scalar bindings (a single field/parameter occurrence),
+//   - every repeated value (e.g. "?tag=a&tag=b") when the destination is the
+//     registered type itself - named slice types included, so the decoder can
+//     decide how to combine repeated occurrences,
+//   - one element per destination element for []T/[N]T fields whose element type T
+//     is registered.
+//
+// Raw values, including empty strings, are passed as-is. A decoder is therefore
+// responsible for treating empty input as a zero value or as an error, matching
+// the contract of BindUnmarshaler.
+//
+// Decoders are consulted only after the built-in scalar conversions and the
+// BindUnmarshaler, bindMultipleUnmarshaler and encoding.TextUnmarshaler
+// interfaces, so registering one never changes the behavior of types the binder
+// already supports (see RegisterTypeDecoder for the type-safe entry point).
+type FieldDecoderFunc func(values []string) (any, error)
+
+// fieldDecoderRegistry maps a reflect.Type to its registered FieldDecoderFunc.
+// Registration usually happens in init() but the map is safe for concurrent
+// reads and writes at any time: per-request binding only reads while handlers
+// may still register additional decoders.
+var fieldDecoderRegistry sync.Map // reflect.Type -> FieldDecoderFunc
+
+func registerFieldDecoder(typ reflect.Type, decoder FieldDecoderFunc) {
+	if typ == nil {
+		panic("echo: custom field decoder type cannot be nil")
+	}
+	if decoder == nil {
+		panic("echo: custom field decoder function cannot be nil")
+	}
+	fieldDecoderRegistry.Store(typ, decoder)
+}
+
+func unregisterFieldDecoder(typ reflect.Type) {
+	if typ == nil {
+		return
+	}
+	fieldDecoderRegistry.Delete(typ)
+}
+
+// lookupFieldDecoder returns the decoder registered for typ.
+func lookupFieldDecoder(typ reflect.Type) (FieldDecoderFunc, bool) {
+	decoder, ok := fieldDecoderRegistry.Load(typ)
+	if !ok {
+		return nil, false
+	}
+	return decoder.(FieldDecoderFunc), true
+}
+
+var (
+	fieldDecoderBindUnmarshalerType = reflect.TypeFor[BindUnmarshaler]()
+	fieldDecoderTextUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+)
+
+// typeHasFieldUnmarshaler reports whether t (or *t) implements one of the
+// unmarshaler interfaces that the binder dispatches BEFORE the custom decoder
+// registry. Composite element decoding must stay out of the way of such types
+// to preserve the existing BindUnmarshaler/TextUnmarshaler behavior.
+func typeHasFieldUnmarshaler(t reflect.Type) bool {
+	if t.Implements(fieldDecoderBindUnmarshalerType) || reflect.PointerTo(t).Implements(fieldDecoderBindUnmarshalerType) {
+		return true
+	}
+	if t.Implements(fieldDecoderTextUnmarshalerType) || reflect.PointerTo(t).Implements(fieldDecoderTextUnmarshalerType) {
+		return true
+	}
+	return false
+}
+
+// isBuiltInBoundType reports whether t is one of the scalar types the binder
+// converts with its built-in conversions. The registry must not shadow these
+// conversions so that registering a decoder cannot change existing behavior
+// (this mirrors bindValue, where the built-in type switch runs first). Named
+// user types such as `type MyInt int` are NOT considered built-in even though
+// their Kind is a scalar kind, so decoders can be registered for them.
+func isBuiltInBoundType(t reflect.Type) bool {
+	if t == reflect.TypeFor[time.Duration]() {
+		return true
+	}
+	switch t.Kind() {
+	case reflect.Bool,
+		reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return t.PkgPath() == ""
+	}
+	return false
+}
+
+// decodeRegisteredInto decodes raw values into an addressable, settable field
+// using a previously registered decoder. It supports:
+//   - T and *T when a decoder is registered for T (nil pointers are allocated and
+//     the decoder receives every value),
+//   - []T and *[]T when a decoder is registered for the element type T,
+//   - [N]T and *[N]T; registered element decoders are used when present and
+//     built-in scalar conversions otherwise.
+//
+// ok is false when no registered decoder applies, in which case callers fall
+// back to their regular type conversion. Decoder errors are returned unwrapped
+// so callers keep their own error envelope (field prefix, HTTP status, ...).
+func decodeRegisteredInto(values []string, field reflect.Value) (bool, error) {
+	if field.Kind() == reflect.Pointer {
+		// a decoder registered for the exact pointer type receives all values
+		if decoder, ok := lookupFieldDecoder(field.Type()); ok {
+			if field.IsNil() {
+				field.Set(reflect.New(field.Type().Elem()))
+			}
+			out, err := decoder(values)
+			if err != nil {
+				return true, err
+			}
+			if out != nil {
+				field.Set(reflect.ValueOf(out))
+			}
+			return true, nil
+		}
+		if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+		return decodeRegisteredInto(values, field.Elem())
+	}
+
+	// built-in scalar types keep their existing conversions everywhere; a
+	// registered decoder can only extend the binder with new (user) types.
+	if isBuiltInBoundType(field.Type()) {
+		return false, nil
+	}
+
+	// a decoder registered for the field type itself receives all values at
+	// once - this covers user types as well as named slice types such as
+	// `type Tags []string` that want their own multi-value semantics.
+	if decoder, ok := lookupFieldDecoder(field.Type()); ok {
+		out, err := decoder(values)
+		if err != nil {
+			return true, err
+		}
+		if out != nil {
+			field.Set(reflect.ValueOf(out))
+		}
+		return true, nil
+	}
+
+	switch field.Kind() {
+	case reflect.Slice:
+		return decodeRegisteredSlice(values, field)
+	case reflect.Array:
+		return decodeRegisteredArray(values, field)
+	}
+	return false, nil
+}
+
+// decodeRegisteredSlice handles []T fields where T has a registered decoder. It
+// returns ok=false so the built-in slice conversion keeps handling built-in
+// elements and elements implementing the unmarshaler interfaces.
+func decodeRegisteredSlice(values []string, sliceField reflect.Value) (bool, error) {
+	elemType := sliceField.Type().Elem()
+	baseType := elemType
+	if elemType.Kind() == reflect.Pointer {
+		baseType = elemType.Elem()
+	}
+	if isBuiltInBoundType(baseType) || typeHasFieldUnmarshaler(baseType) {
+		return false, nil
+	}
+	if _, ok := lookupFieldDecoder(baseType); !ok {
+		return false, nil
+	}
+
+	slice := reflect.MakeSlice(sliceField.Type(), len(values), len(values))
+	for i, raw := range values {
+		if _, err := decodeRegisteredInto([]string{raw}, slice.Index(i)); err != nil {
+			return true, err
+		}
+	}
+	sliceField.Set(slice)
+	return true, nil
+}
+
+// decodeRegisteredArray handles fixed-size [N]T fields. Element decoders are
+// used when registered; otherwise elements go through the built-in scalar
+// conversion, so plain [N]int and friends bind too. Extra values are an error.
+func decodeRegisteredArray(values []string, arrayField reflect.Value) (bool, error) {
+	arrayType := arrayField.Type()
+	if len(values) > arrayType.Len() {
+		return true, fmt.Errorf("too many values (%d) for array %s of length %d", len(values), arrayType, arrayType.Len())
+	}
+
+	elemType := arrayType.Elem()
+	baseType := elemType
+	if elemType.Kind() == reflect.Pointer {
+		baseType = elemType.Elem()
+	}
+	_, elementDecoderRegistered := lookupFieldDecoder(baseType)
+	if isBuiltInBoundType(baseType) || typeHasFieldUnmarshaler(baseType) {
+		elementDecoderRegistered = false
+	}
+
+	for i, raw := range values {
+		element := arrayField.Index(i) // addressable
+		if elementDecoderRegistered {
+			if _, err := decodeRegisteredInto([]string{raw}, element); err != nil {
+				return true, err
+			}
+			continue
+		}
+		if err := setWithProperType(elemType.Kind(), raw, element); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
 }
 
 // ValueBinder provides utility methods for binding query or path parameter to various Go built-in types
@@ -247,6 +466,47 @@ func (b *ValueBinder) customFunc(sourceParam string, customFunc func(values []st
 	}
 	if errs := customFunc(values); errs != nil {
 		b.errors = append(b.errors, errs...)
+	}
+	return b
+}
+
+// CustomType binds parameter values into dest using the FieldDecoderFunc registered
+// for dest's element type (see RegisterTypeDecoder). dest must be a non-nil pointer,
+// for example `*MyType`, `*[]MyType` or `*[3]int`. When the parameter is absent dest is
+// left untouched; use MustCustomType to require the parameter.
+func (b *ValueBinder) CustomType(sourceParam string, dest any) *ValueBinder {
+	return b.customType(sourceParam, dest, false)
+}
+
+// MustCustomType requires parameter values to exist and binds them into dest using the
+// FieldDecoderFunc registered for dest's element type (see RegisterTypeDecoder).
+// Returns an error when the parameter does not exist or no decoder is registered.
+func (b *ValueBinder) MustCustomType(sourceParam string, dest any) *ValueBinder {
+	return b.customType(sourceParam, dest, true)
+}
+
+func (b *ValueBinder) customType(sourceParam string, dest any, valueMustExist bool) *ValueBinder {
+	if b.failFast && b.errors != nil {
+		return b
+	}
+
+	values := b.ValuesFunc(sourceParam)
+	if len(values) == 0 {
+		if valueMustExist {
+			b.setError(b.ErrorFunc(sourceParam, []string{}, "required field value is empty", nil))
+		}
+		return b
+	}
+
+	rv := reflect.ValueOf(dest)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		b.setError(b.ErrorFunc(sourceParam, values, fmt.Sprintf("custom type bind destination must be a non-nil pointer, got %T", dest), nil))
+		return b
+	}
+	if ok, err := decodeRegisteredInto(values, rv.Elem()); err != nil {
+		b.setError(b.ErrorFunc(sourceParam, values, "failed to bind field value with registered custom decoder", err))
+	} else if !ok {
+		b.setError(b.ErrorFunc(sourceParam, values, fmt.Sprintf("no custom field decoder registered for type %T", dest), nil))
 	}
 	return b
 }

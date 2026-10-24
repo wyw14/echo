@@ -6,11 +6,14 @@ package echo
 import (
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1613,4 +1616,245 @@ func TestFormValuesOr(t *testing.T) {
 			assert.Equal(t, tc.expect, v)
 		})
 	}
+}
+
+// customDecPoint is a plain user type implementing NONE of the unmarshaler
+// interfaces - without a registered decoder it cannot be bound from strings.
+type customDecPoint struct {
+	X int
+	Y int
+}
+
+// customDecDate is a time-like user type parsed with a fixed date layout.
+type customDecDate time.Time
+
+// customDecTags is a named slice type whose own decoder combines repeated values.
+type customDecTags []string
+
+// customDecPositive is a named scalar kind (int) - named types stay registry
+// eligible while the predeclared int keeps its built-in conversion.
+type customDecPositive int
+
+func decodeTestPoint(values []string) (customDecPoint, error) {
+	raw := values[0]
+	if raw == "" {
+		return customDecPoint{}, nil // empty input decodes to the zero value
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) != 2 {
+		return customDecPoint{}, fmt.Errorf("invalid point %q", raw)
+	}
+	x, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return customDecPoint{}, err
+	}
+	y, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return customDecPoint{}, err
+	}
+	return customDecPoint{X: x, Y: y}, nil
+}
+
+func decodeTestDate(values []string) (customDecDate, error) {
+	parsed, err := time.Parse("2006-01-02", values[0])
+	if err != nil {
+		return customDecDate{}, err
+	}
+	return customDecDate(parsed), nil
+}
+
+func decodeTestTags(values []string) (customDecTags, error) {
+	return customDecTags(values), nil
+}
+
+func decodeTestPositive(values []string) (customDecPositive, error) {
+	n, err := strconv.Atoi(values[0])
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("value must be positive, got %d", n)
+	}
+	return customDecPositive(n), nil
+}
+
+// registerTestDecoder registers fn for T and removes it again when the test ends.
+func registerTestDecoder[T any](t *testing.T, fn func(values []string) (T, error)) {
+	t.Helper()
+	RegisterTypeDecoder(fn)
+	t.Cleanup(func() {
+		UnregisterTypeDecoder[T]()
+	})
+}
+
+func TestParseValue_CustomDecoder_UserType(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	var testCases = []struct {
+		name      string
+		when      string
+		expect    customDecPoint
+		expectErr string
+	}{
+		{name: "ok", when: "1,2", expect: customDecPoint{X: 1, Y: 2}},
+		{name: "ok, empty value is zero", when: "", expect: customDecPoint{}},
+		{name: "nok, invalid value", when: "oops", expect: customDecPoint{}, expectErr: `failed to parse value, err: invalid point "oops"`},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := ParseValue[customDecPoint](tc.when)
+			if tc.expectErr != "" {
+				assert.EqualError(t, err, tc.expectErr)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tc.expect, v)
+		})
+	}
+}
+
+func TestParseValue_CustomDecoder_TimeType(t *testing.T) {
+	registerTestDecoder(t, decodeTestDate)
+
+	v, err := ParseValue[customDecDate]("2024-05-06")
+	assert.NoError(t, err)
+	assert.Equal(t, customDecDate(time.Date(2024, 5, 6, 0, 0, 0, 0, time.UTC)), v)
+
+	_, err = ParseValue[customDecDate]("not-a-date")
+	assert.ErrorContains(t, err, "failed to parse value")
+}
+
+func TestParseValue_CustomDecoder_NamedScalarKind(t *testing.T) {
+	registerTestDecoder(t, decodeTestPositive)
+
+	v, err := ParseValue[customDecPositive]("7")
+	assert.NoError(t, err)
+	assert.Equal(t, customDecPositive(7), v)
+
+	// predeclared int must keep using its built-in conversion even though a
+	// decoder exists for a named int kind.
+	builtin, err := ParseValue[int]("7")
+	assert.NoError(t, err)
+	assert.Equal(t, 7, builtin)
+
+	_, err = ParseValue[customDecPositive]("-1")
+	assert.EqualError(t, err, "failed to parse value, err: value must be positive, got -1")
+}
+
+// A registered decoder must not be able to change the behavior of a type that
+// already implements BindUnmarshaler: the interface keeps precedence.
+func TestParseValue_CustomDecoder_InterfaceKeepsPrecedence(t *testing.T) {
+	registerTestDecoder(t, func([]string) (Timestamp, error) {
+		return Timestamp{}, errors.New("registered decoder must not be called for BindUnmarshaler")
+	})
+
+	expected, _ := time.Parse(time.RFC3339, "2020-12-23T09:45:31+02:00")
+	v, err := ParseValue[Timestamp]("2020-12-23T09:45:31+02:00")
+	assert.NoError(t, err)
+	assert.Equal(t, Timestamp(expected), v)
+}
+
+func TestParseValue_CustomDecoder_UnsupportedWhenUnregistered(t *testing.T) {
+	_, err := ParseValue[customDecPoint]("1,2")
+	assert.EqualError(t, err, "failed to parse value, err: unsupported value type: *echo.customDecPoint")
+}
+
+func TestRegisterTypeDecoder_Unregister(t *testing.T) {
+	RegisterTypeDecoder(decodeTestPoint)
+	v, err := ParseValue[customDecPoint]("3,4")
+	assert.NoError(t, err)
+	assert.Equal(t, customDecPoint{X: 3, Y: 4}, v)
+
+	UnregisterTypeDecoder[customDecPoint]()
+	_, err = ParseValue[customDecPoint]("3,4")
+	assert.ErrorContains(t, err, "unsupported value type")
+}
+
+func TestRegisterTypeDecoder_NilDecoderPanics(t *testing.T) {
+	assert.Panics(t, func() {
+		RegisterTypeDecoder[customDecPoint](nil)
+	})
+}
+
+func TestParseValues_CustomDecoder(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	v, err := ParseValues[customDecPoint]([]string{"1,2", "3,4"})
+	assert.NoError(t, err)
+	assert.Equal(t, []customDecPoint{{X: 1, Y: 2}, {X: 3, Y: 4}}, v)
+
+	// an invalid element aborts parsing and wraps the decoder error.
+	_, err = ParseValues[customDecPoint]([]string{"1,2", "bad"})
+	assert.EqualError(t, err, `failed to parse value, err: invalid point "bad"`)
+}
+
+func TestQueryParam_CustomDecoder(t *testing.T) {
+	registerTestDecoder(t, decodeTestPoint)
+
+	t.Run("ok, single value", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?p=1,2", nil)
+		c := NewContext(req, nil)
+
+		v, err := QueryParam[customDecPoint](c, "p")
+		assert.NoError(t, err)
+		assert.Equal(t, customDecPoint{X: 1, Y: 2}, v)
+	})
+
+	t.Run("ok, empty value is zero", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?p=", nil)
+		c := NewContext(req, nil)
+
+		v, err := QueryParam[customDecPoint](c, "p")
+		assert.NoError(t, err)
+		assert.Equal(t, customDecPoint{}, v)
+	})
+
+	t.Run("nok, invalid value keeps the BindingError field envelope", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?p=bad", nil)
+		c := NewContext(req, nil)
+
+		_, err := QueryParam[customDecPoint](c, "p")
+		assert.EqualError(t, err, `code=400, message=query param, err=failed to parse value, err: invalid point "bad", field=p`)
+	})
+
+	t.Run("ok, repeated values decode element by element", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?p=1,2&p=3,4", nil)
+		c := NewContext(req, nil)
+
+		v, err := QueryParams[customDecPoint](c, "p")
+		assert.NoError(t, err)
+		assert.Equal(t, []customDecPoint{{X: 1, Y: 2}, {X: 3, Y: 4}}, v)
+	})
+}
+
+// The registry is read on every request and may be (re)registered while the
+// server is already running; concurrent reads and writes must stay race-free.
+func TestRegisterTypeDecoder_ConcurrentAccess(t *testing.T) {
+	registerTestDecoder(t, decodeTestPositive) // a stable decoder readers can use
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				RegisterTypeDecoder(decodeTestPoint)
+				if _, err := ParseValue[customDecPositive]("5"); err != nil {
+					t.Errorf("stable decoder failed: %v", err)
+				}
+				UnregisterTypeDecoder[customDecPoint]()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			v, err := ParseValue[customDecPositive]("9")
+			if err == nil && v != customDecPositive(9) {
+				t.Errorf("unexpected value: %v", v)
+			}
+		}
+	}()
+	wg.Wait()
 }

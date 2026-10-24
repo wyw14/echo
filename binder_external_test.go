@@ -132,3 +132,35 @@ func ExampleValueBinder_CustomFunc() {
 
 	// Output: length = 25, base64 = Hello World
 }
+
+func ExampleRegisterTypeDecoder() {
+	// a user type that implements none of the binder unmarshaler interfaces
+	type Point struct {
+		X int
+		Y int
+	}
+	echo.RegisterTypeDecoder(func(values []string) (Point, error) {
+		var p Point
+		if _, err := fmt.Sscanf(values[0], "%d,%d", &p.X, &p.Y); err != nil {
+			return p, err
+		}
+		return p, nil
+	})
+
+	type Query struct {
+		Origin Point `query:"origin"`
+	}
+
+	e := echo.New()
+	c := e.NewContext(
+		httptest.NewRequest(http.MethodGet, "/api?origin=1,2", nil),
+		httptest.NewRecorder(),
+	)
+	var q Query
+	if err := c.Bind(&q); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("origin = %+v", q.Origin)
+
+	// Output: origin = {X:1 Y:2}
+}
