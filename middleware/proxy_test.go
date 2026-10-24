@@ -1352,3 +1352,76 @@ func TestProxyWebSocketXForwardedFor(t *testing.T) {
 		})
 	}
 }
+
+// TestProxyWebSocketForwardedHeaders verifies that on a WebSocket upgrade the proxy middleware
+// forwards the same canonical client-identity headers as the HTTP path: X-Real-IP is always
+// overwritten, X-Forwarded-For keeps the incoming chain with the peer appended, X-Forwarded-Proto
+// is derived from the actual scheme and the legacy scheme headers (X-Forwarded-Ssl,
+// X-Forwarded-Protocol, X-Url-Scheme) are removed.
+func TestProxyWebSocketForwardedHeaders(t *testing.T) {
+	headerCh := make(chan http.Header, 1)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wsHandler := func(conn *websocket.Conn) {
+			headerCh <- conn.Request().Header.Clone()
+			defer conn.Close()
+			var msg string
+			if err := websocket.Message.Receive(conn, &msg); err == nil {
+				_ = websocket.Message.Send(conn, msg)
+			}
+		}
+		websocket.Server{Handler: wsHandler}.ServeHTTP(w, r)
+	}))
+	defer upstream.Close()
+
+	tgtURL, _ := url.Parse(upstream.URL)
+	e := echo.New()
+	// Resolve the scheme from the actual connection so a client-supplied X-Forwarded-Proto can
+	// not influence the header value forwarded upstream.
+	e.SchemeExtractor = echo.ExtractSchemeDirect()
+	e.Use(ProxyWithConfig(ProxyConfig{Balancer: NewRandomBalancer([]*ProxyTarget{{URL: tgtURL}})}))
+	proxySrv := httptest.NewServer(e)
+	defer proxySrv.Close()
+
+	proxyWSURL, _ := url.Parse(proxySrv.URL)
+	proxyWSURL.Scheme = "ws"
+	proxyWSURL.Path = "/"
+	origin, _ := url.Parse(proxySrv.URL)
+	cfg := &websocket.Config{
+		Location: proxyWSURL,
+		Origin:   origin,
+		Version:  websocket.ProtocolVersionHybi13,
+		Header: http.Header{
+			echo.HeaderXRealIP:         {"6.6.6.6"},
+			echo.HeaderXForwardedFor:   {"203.0.113.9"},
+			echo.HeaderXForwardedProto: {"https"},
+			echo.HeaderXForwardedSsl:   {"on"},
+			echo.HeaderXUrlScheme:      {"https"},
+		},
+	}
+
+	wsConn, err := websocket.DialConfig(cfg)
+	assert.NoError(t, err)
+	defer wsConn.Close()
+
+	assert.NoError(t, websocket.Message.Send(wsConn, "ping"))
+	var got string
+	assert.NoError(t, websocket.Message.Receive(wsConn, &got))
+	assert.Equal(t, "ping", got)
+
+	select {
+	case captured := <-headerCh:
+		assert.Equal(t, "127.0.0.1", captured.Get(echo.HeaderXRealIP),
+			"client-supplied X-Real-IP must be overwritten with the direct peer")
+		assert.Equal(t, []string{"203.0.113.9", "127.0.0.1"},
+			strings.Split(captured.Get(echo.HeaderXForwardedFor), ", "),
+			"X-Forwarded-For must preserve the incoming chain with the peer appended")
+		assert.Equal(t, "http", captured.Get(echo.HeaderXForwardedProto),
+			"spoofed X-Forwarded-Proto must be replaced with the actual scheme")
+		assert.Empty(t, captured.Get(echo.HeaderXForwardedSsl))
+		assert.Empty(t, captured.Get(echo.HeaderXForwardedProtocol))
+		assert.Empty(t, captured.Get(echo.HeaderXUrlScheme))
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream did not receive the websocket request headers")
+	}
+}

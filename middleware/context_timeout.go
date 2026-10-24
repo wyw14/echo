@@ -57,6 +57,16 @@ func (config ContextTimeoutConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
 				return next(c)
 			}
 
+			// A WebSocket upgrade hijacks the connection and the session can legitimately outlive
+			// any request timeout: canceling its context mid-session would tear down a healthy
+			// socket (for example an idle stream waiting for the next frame). The upgraded
+			// connection owns its own context lifecycle instead, which is released when the socket
+			// closes, when the peer half-closes it or when the server shuts down.
+			// Handshake failures are handled as ordinary HTTP errors and release normally.
+			if c.IsWebSocket() {
+				return next(c)
+			}
+
 			timeoutContext, cancel := context.WithTimeout(c.Request().Context(), config.Timeout)
 			defer cancel()
 

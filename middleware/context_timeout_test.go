@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"github.com/labstack/echo/v5"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/net/websocket"
 )
 
 func TestContextTimeoutSkipper(t *testing.T) {
@@ -226,4 +229,65 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// TestContextTimeoutWebSocketUpgrade verifies that a WebSocket session is not killed by the
+// ContextTimeout deadline while ordinary slow HTTP handlers still receive 503. The upgraded
+// connection keeps its own request context lifecycle and is released when the socket closes.
+func TestContextTimeoutWebSocketUpgrade(t *testing.T) {
+	t.Parallel()
+
+	e := echo.New()
+	e.Use(ContextTimeout(60 * time.Millisecond))
+
+	upgrader := &echo.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	e.GET("/ws", func(c *echo.Context) error {
+		ws, err := upgrader.Upgrade(c)
+		if err != nil {
+			return err
+		}
+		defer ws.Close()
+
+		messageType, msg, err := ws.ReadMessage()
+		if err != nil {
+			return nil
+		}
+		// Hold the hijacked session open well beyond the 60ms request timeout.
+		time.Sleep(200 * time.Millisecond)
+		return ws.WriteMessage(messageType, msg)
+	})
+	e.GET("/slow", func(c *echo.Context) error {
+		return sleepWithContext(c.Request().Context(), time.Second)
+	})
+
+	ts := httptest.NewServer(e)
+	defer ts.Close()
+
+	wsURL, _ := url.Parse(ts.URL)
+	wsURL.Scheme = "ws"
+	wsURL.Path = "/ws"
+	origin, _ := url.Parse(ts.URL)
+	cfg := &websocket.Config{
+		Location: wsURL,
+		Origin:   origin,
+		Version:  websocket.ProtocolVersionHybi13,
+	}
+	wsConn, err := websocket.DialConfig(cfg)
+	require.NoError(t, err)
+	defer wsConn.Close()
+
+	start := time.Now()
+	require.NoError(t, websocket.Message.Send(wsConn, "late-echo"))
+	var got string
+	require.NoError(t, websocket.Message.Receive(wsConn, &got))
+	assert.Equal(t, "late-echo", got)
+	assert.GreaterOrEqual(t, time.Since(start), 150*time.Millisecond,
+		"websocket session must survive the ContextTimeout deadline")
+
+	// Ordinary slow HTTP handlers keep their original timeout behavior.
+	resp, err := http.Get(ts.URL + "/slow")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	_, _ = io.Copy(io.Discard, resp.Body)
 }

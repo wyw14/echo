@@ -105,6 +105,10 @@ func (sc StartConfig) start(ctx stdContext.Context, h http.Handler) error {
 		logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	}
 
+	// Connections hijacked from net/http (for example WebSocket upgrades) are invisible to
+	// http.Server.Shutdown, so track them separately to release them on shutdown.
+	tracker := newHijackedConnTracker()
+
 	server := http.Server{
 		Handler:  h,
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
@@ -114,6 +118,13 @@ func (sc StartConfig) start(ctx stdContext.Context, h http.Handler) error {
 		// WriteTimeout is a max time allowed to write the response
 		// IMPORTANT: set this to 0 when using Server-Sent-Events (SSE) or some larger duration when serving static files
 		// WriteTimeout: 30 * time.Second,
+
+		// BaseContext is resolved once per listener and becomes the parent context of every request
+		// context, so upgraded handlers can find the tracker without any per-request allocation.
+		// Ordinary HTTP requests only carry an additional context value and are otherwise untouched.
+		BaseContext: func(net.Listener) stdContext.Context {
+			return stdContext.WithValue(stdContext.Background(), serverContextKey{}, tracker)
+		},
 	}
 
 	listener := sc.Listener
@@ -157,7 +168,7 @@ func (sc StartConfig) start(ctx stdContext.Context, h http.Handler) error {
 
 	if sc.GracefulTimeout >= 0 {
 		wg.Go(func() {
-			gracefulShutdown(gCtx, &sc, &server, logger)
+			gracefulShutdown(gCtx, &sc, &server, tracker, logger)
 		})
 	}
 
@@ -178,7 +189,7 @@ func filepathOrContent(fileOrContent any, certFilesystem fs.FS) (content []byte,
 	}
 }
 
-func gracefulShutdown(shutdownCtx stdContext.Context, sc *StartConfig, server *http.Server, logger *slog.Logger) {
+func gracefulShutdown(shutdownCtx stdContext.Context, sc *StartConfig, server *http.Server, tracker *hijackedConnTracker, logger *slog.Logger) {
 	<-shutdownCtx.Done() // wait until shutdown context is closed.
 	// note: is server if closed by other means this method is still run but is good as no-op
 
@@ -189,12 +200,97 @@ func gracefulShutdown(shutdownCtx stdContext.Context, sc *StartConfig, server *h
 	waitShutdownCtx, cancel := stdContext.WithTimeout(stdContext.Background(), timeout)
 	defer cancel()
 
-	if err := server.Shutdown(waitShutdownCtx); err != nil {
+	shutdownErr := server.Shutdown(waitShutdownCtx)
+	// Even when the graceful deadline for ordinary handlers expired, still release hijacked
+	// connections (WebSockets): http.Server.Shutdown never tracks those, so without this they
+	// would outlive Start() together with their request contexts.
+	tracker.shutdownAll(waitShutdownCtx)
+
+	if shutdownErr != nil {
 		// we end up here when listeners are not shut down within given timeout
 		if sc.OnShutdownError != nil {
-			sc.OnShutdownError(err)
+			sc.OnShutdownError(shutdownErr)
 			return
 		}
-		logger.Error("failed to shut down server within given timeout", "error", err)
+		logger.Error("failed to shut down server within given timeout", "error", shutdownErr)
+	}
+}
+
+// serverContextKey carries the per-server hijacked connection tracker in request contexts created
+// by BaseContext.
+type serverContextKey struct{}
+
+// hijackedConnTracker keeps connections that handlers hijacked from net/http (WebSocket upgrades,
+// raw TCP proxies). http.Server.Shutdown does not know about them, so the server has to close them
+// itself on graceful shutdown to guarantee that the connections and their request contexts are
+// released.
+type hijackedConnTracker struct {
+	mu     sync.Mutex
+	closed bool
+	// conns maps the hijacked net.Conn to a function that performs a protocol-aware graceful close
+	// (e.g. sends a WebSocket GoingAway close frame) and releases the underlying connection.
+	conns map[net.Conn]func()
+	wg    sync.WaitGroup
+}
+
+func newHijackedConnTracker() *hijackedConnTracker {
+	return &hijackedConnTracker{conns: make(map[net.Conn]func())}
+}
+
+// add registers an active hijacked connection. If shutdown already happened, the connection is
+// closed immediately instead of being tracked.
+func (t *hijackedConnTracker) add(conn net.Conn, gracefullyClose func()) {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		gracefullyClose()
+		return
+	}
+	t.conns[conn] = gracefullyClose
+	t.wg.Add(1)
+	t.mu.Unlock()
+}
+
+// remove deregisters a hijacked connection, typically from its own close path. It is a no-op when
+// the connection is not tracked (for example because it was closed during shutdown).
+func (t *hijackedConnTracker) remove(conn net.Conn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.conns[conn]; ok {
+		delete(t.conns, conn)
+		t.wg.Done()
+	}
+}
+
+// shutdownAll asks every tracked connection to close gracefully and waits for their handlers to
+// release them, or for ctx to expire. Closing the raw sockets unblocks in-flight reads and cancels
+// the hijacked requests' contexts. It is safe to call once; subsequent calls are no-ops.
+func (t *hijackedConnTracker) shutdownAll(ctx stdContext.Context) {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	closers := make([]func(), 0, len(t.conns))
+	for _, closeConn := range t.conns {
+		closers = append(closers, closeConn)
+	}
+	t.mu.Unlock()
+
+	for _, closeConn := range closers {
+		closeConn()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// Handlers that ignore the closed socket keep the process alive no longer than any other
+		// slow handler; the sockets themselves are already closed.
 	}
 }
