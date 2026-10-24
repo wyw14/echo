@@ -5,6 +5,7 @@ package echo
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,6 +27,15 @@ type Response struct {
 	Status     int
 	Size       int64
 	Committed  bool
+
+	// hookBus holds the per-request response lifecycle observers and the close watcher state.
+	// It is nil unless at least one hook is registered, keeping the unobserved hot path free of
+	// allocations and locks. Replaced with a fresh bus on every reset.
+	hookBus *responseHookBus
+	// reqCtx/hookReq are the current request context/request, set by initHooks in ServeHTTP so
+	// that per-request AddResponseHook (e.g. from a middleware) can start the connection watcher.
+	reqCtx  context.Context
+	hookReq *http.Request
 }
 
 // NewResponse creates a new instance of Response.
@@ -52,26 +62,75 @@ func (r *Response) WriteHeader(code int) {
 		r.logger.Error("echo: response already written to client")
 		return
 	}
-	r.Status = code
+	// Record the chosen status before beforeFuncs run (they may change it) and do so under the
+	// hook lock so a disconnect watcher snapshotting a live response can not race the update.
+	if bus := r.hookBus; bus != nil {
+		bus.mu.Lock()
+		r.Status = code
+		bus.mu.Unlock()
+	} else {
+		r.Status = code
+	}
 	for _, fn := range r.beforeFuncs {
 		fn()
 	}
 	r.ResponseWriter.WriteHeader(r.Status)
-	r.Committed = true
+	// The status is on the wire now: mark committed and notify observers only afterwards. Because
+	// the event is dispatched after the transport write, a slow or panicking hook can neither
+	// delay the header nor change the status code.
+	bus := r.hookBus
+	if bus != nil {
+		bus.mu.Lock()
+		r.Committed = true
+		info := bus.snapshot(r, ResponseEventHeaderCommitted, nil)
+		bus.mu.Unlock()
+		bus.dispatch(info)
+	} else {
+		r.Committed = true
+	}
 }
 
 // Write writes the data to the connection as part of an HTTP reply.
 func (r *Response) Write(b []byte) (n int, err error) {
 	if !r.Committed {
-		if r.Status == 0 {
-			r.Status = http.StatusOK
+		// Implicit 200 OK, matching net/http behavior. Resolve the code under the hook lock so
+		// the Status read is synchronized with the disconnect watcher.
+		code := http.StatusOK
+		if bus := r.hookBus; bus != nil {
+			bus.mu.Lock()
+			if r.Status != 0 {
+				code = r.Status
+			}
+			bus.mu.Unlock()
+		} else if r.Status != 0 {
+			code = r.Status
 		}
-		r.WriteHeader(r.Status)
+		r.WriteHeader(code)
 	}
 	n, err = r.ResponseWriter.Write(b)
-	r.Size += int64(n)
+
+	// The exactly-once first-byte event is decided together with the Size update under the hook
+	// lock, after bytes have already reached the underlying writer.
+	bus := r.hookBus
+	var firstByteInfo ResponseHookInfo
+	dispatchFirstByte := false
+	if bus != nil {
+		bus.mu.Lock()
+		r.Size += int64(n)
+		if n > 0 && !bus.firstByte {
+			bus.firstByte = true
+			firstByteInfo = bus.snapshot(r, ResponseEventFirstByte, err)
+			dispatchFirstByte = true
+		}
+		bus.mu.Unlock()
+	} else {
+		r.Size += int64(n)
+	}
 	for _, fn := range r.afterFuncs {
 		fn()
+	}
+	if dispatchFirstByte {
+		bus.dispatch(firstByteInfo)
 	}
 	return
 }
@@ -83,6 +142,11 @@ func (r *Response) Flush() {
 	err := http.NewResponseController(r.ResponseWriter).Flush()
 	if err != nil && errors.Is(err, http.ErrNotSupported) {
 		panic(fmt.Errorf("echo: response writer %T does not support flushing (http.Flusher interface)", r.ResponseWriter))
+	}
+	// Notify only after the underlying flush succeeded: observers can never alter the streaming
+	// protocol behavior, and HTTP/2 flush semantics are inherited unchanged from the transport.
+	if err == nil {
+		r.emitEvent(ResponseEventFlush, nil)
 	}
 }
 
@@ -114,6 +178,11 @@ func (r *Response) reset(w http.ResponseWriter) {
 	r.Size = 0
 	r.Status = http.StatusOK
 	r.Committed = false
+	// Detach the previous request's observer bus. A lingering close watcher keeps its own old bus
+	// reference and the immutable final snapshot, so it can never observe the next pooled request.
+	r.hookBus = nil
+	r.reqCtx = nil
+	r.hookReq = nil
 }
 
 // UnwrapResponse unwraps given ResponseWriter to return contexts original Echo Response. rw has to implement
@@ -200,7 +269,7 @@ func (w *headResponseWriter) WriteHeader(code int) {
 	w.wroteStatus = true
 	w.status = code
 	if r, err := UnwrapResponse(w.rw); err == nil {
-		r.Committed = true
+		r.setCommitted(true)
 	}
 }
 
@@ -239,7 +308,7 @@ func (w *headResponseWriter) commit() {
 		// WriteHeader set Committed=true early so route middleware could observe it.
 		// Reset it here so *Response.WriteHeader can fire beforeFuncs and reach the transport.
 		if r, err := UnwrapResponse(w.rw); err == nil {
-			r.Committed = false
+			r.setCommitted(false)
 		}
 		w.rw.WriteHeader(w.status)
 		// Fire After hooks on the underlying *Response so that middleware such as
@@ -247,7 +316,7 @@ func (w *headResponseWriter) commit() {
 		// Size is set to bodyBytes (what GET would have written) so hooks see the
 		// correct value when computing Content-Length or recording response size.
 		if r, err := UnwrapResponse(w.rw); err == nil {
-			r.Size = w.bodyBytes
+			r.setSize(w.bodyBytes)
 			for _, fn := range r.afterFuncs {
 				fn()
 			}

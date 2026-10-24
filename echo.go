@@ -88,6 +88,12 @@ type Echo struct {
 	HTTPErrorHandler HTTPErrorHandler
 	Logger           *slog.Logger
 
+	// responseHooks are read-only observers installed for every request; they receive response
+	// lifecycle events (header commit, first byte, flush, handler done, connection close).
+	// Configure via AddResponseHook or Config.ResponseHooks. Like middleware, append-only before
+	// the server starts; mutating after serving is not goroutine-safe.
+	responseHooks []ResponseHookFunc
+
 	contextPool sync.Pool
 
 	router Router
@@ -277,6 +283,14 @@ type Config struct {
 	// If not set, no callback is executed.
 	OnAddRoute func(route Route) error
 
+	// ResponseHooks installs read-only response lifecycle observers for every request. Each hook
+	// is notified when headers are committed, the first body byte is written, a flush happens,
+	// the handler chain returns and when the connection closes (including client disconnects).
+	// Observers must be fast and panic-free: a panicking hook is recovered and logged and can
+	// never change the response status code, body or protocol behavior (streaming and HTTP/2
+	// included). See ResponseHookFunc and ResponseHookInfo for the full contract.
+	ResponseHooks []ResponseHookFunc
+
 	// Filesystem is the fs.FS implementation used for serving static files.
 	// Supports os.DirFS, embed.FS, and custom implementations.
 	// If not set, defaults to current working directory.
@@ -365,6 +379,9 @@ func NewWithConfig(config Config) *Echo {
 	}
 	if config.OnAddRoute != nil {
 		e.OnAddRoute = config.OnAddRoute
+	}
+	if len(config.ResponseHooks) > 0 {
+		e.responseHooks = append(e.responseHooks, config.ResponseHooks...)
 	}
 	if config.Filesystem != nil {
 		e.Filesystem = config.Filesystem
@@ -521,6 +538,19 @@ func (e *Echo) Pre(middleware ...MiddlewareFunc) {
 func (e *Echo) Use(middleware ...MiddlewareFunc) {
 	e.middleware = append(e.middleware, middleware...)
 	e.buildRouterChains()
+}
+
+// AddResponseHook registers read-only response lifecycle observers that are installed for every
+// incoming request. Hooks are notified (after the fact) when response headers are committed, the
+// first response byte is written, a flush happens, the handler chain returns and when the
+// connection closes or the peer disconnects.
+//
+// Hooks observe only; a panicking hook is recovered and logged and can never alter the response
+// status code, body, streaming semantics or HTTP/2 behavior. Hooks run synchronously on the
+// serving goroutine and should return quickly; see ResponseHookFunc for the contract.
+// Register before starting the server; registration is not goroutine-safe alongside serving.
+func (e *Echo) AddResponseHook(hooks ...ResponseHookFunc) {
+	e.responseHooks = append(e.responseHooks, hooks...)
 }
 
 // CONNECT registers a new CONNECT route for a path with matching handler in the
@@ -830,6 +860,18 @@ func (e *Echo) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer e.contextPool.Put(c)
 
 	c.Reset(r, w)
+	// Install globally registered response lifecycle observers (and the connection-close
+	// watcher) before any middleware or handler runs.
+	c.orgResponse.initHooks(r, e.responseHooks)
+
+	// If the chain panics without a Recover middleware, still hand the close watcher an immutable
+	// snapshot so it never reads the pooled (and possibly reused) Response afterwards.
+	defer func() {
+		if recov := recover(); recov != nil {
+			c.orgResponse.abortHooks()
+			panic(recov)
+		}
+	}()
 
 	// The global (e.chain) and pre-middleware (e.preChain) chains are compiled once in buildRouterChains and
 	// reused here, so no middleware closures are allocated per request.
@@ -843,6 +885,14 @@ func (e *Echo) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		e.HTTPErrorHandler(c, err)
+	}
+
+	// Emit handler-done and release the connection-close watcher. The resolved status is what
+	// net/http would send when nothing was committed (e.g. a handler that returns without
+	// writing, or an empty response).
+	if c.orgResponse.hookBus != nil {
+		_, resolvedStatus := ResolveResponseStatus(c.response, err)
+		c.orgResponse.finishHooks(resolvedStatus, err)
 	}
 }
 
